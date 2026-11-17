@@ -1,0 +1,298 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Wheel Truing Advisor</title>
+<link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+<script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.20.1/dist/ort.min.js"></script>
+<style>
+  .table-wrap { max-height: 60vh; overflow: auto; }
+  td input, td select { min-width: 5rem; }
+  tr.hl > * { background: #fff3cd !important; }
+</style>
+</head>
+<body class="bg-light">
+<div class="container py-4">
+  <div class="d-flex justify-content-between align-items-center mb-3">
+    <h1 class="h3 mb-0">Wheel Truing Advisor</h1>
+    <span id="modelStatus" class="badge text-bg-secondary">loading model…</span>
+  </div>
+
+  <div id="alertBox" class="alert alert-danger d-none"></div>
+
+  <div class="row g-3">
+    <!-- Settings -->
+    <div class="col-lg-4">
+      <div class="card shadow-sm">
+        <div class="card-header fw-semibold">Settings (copy from training env)</div>
+        <div class="card-body">
+          <div class="row g-2">
+            <div class="col-6"><label class="form-label small">Spokes N</label>
+              <input id="cfgN" type="number" class="form-control form-control-sm" value="32" min="4"></div>
+            <div class="col-6"><label class="form-label small">Max steps</label>
+              <input id="maxSteps" type="number" class="form-control form-control-sm" value="200"></div>
+            <div class="col-6"><label class="form-label small">Goal lateral (mm)</label>
+              <input id="goalLat" type="number" step="0.01" class="form-control form-control-sm" value="0.2"></div>
+            <div class="col-6"><label class="form-label small">Goal radial (mm)</label>
+              <input id="goalRad" type="number" step="0.01" class="form-control form-control-sm" value="0.3"></div>
+            <div class="col-12"><label class="form-label small">Tension mid (N; one value or N values)</label>
+              <input id="tMid" class="form-control form-control-sm" value="950"></div>
+            <div class="col-12"><label class="form-label small">Tension half-range (N)</label>
+              <input id="tHalf" class="form-control form-control-sm" value="650"></div>
+            <div class="col-6"><label class="form-label small">Safe min (N)</label>
+              <input id="tMin" class="form-control form-control-sm" value="300"></div>
+            <div class="col-6"><label class="form-label small">Safe max (N)</label>
+              <input id="tMax" class="form-control form-control-sm" value="1600"></div>
+            <div class="col-12"><label class="form-label small">Δtension per ¼ turn (N)</label>
+              <input id="dT" type="number" step="1" class="form-control form-control-sm" value="20"></div>
+            <div class="col-12"><label class="form-label small">Action index layout</label>
+              <select id="layout" class="form-select form-select-sm">
+                <option value="interleaved">a = spoke*2 + dir</option>
+                <option value="blocked">a = dir*N + spoke</option>
+              </select></div>
+            <div class="col-12"><label class="form-label small">Which dir means TIGHTEN</label>
+              <select id="tightenDir" class="form-select form-select-sm">
+                <option value="0">dir 0 = tighten, 1 = loosen</option>
+                <option value="1">dir 1 = tighten, 0 = loosen</option>
+              </select></div>
+            <div class="col-8"><label class="form-label small">Current step</label>
+              <input id="step" type="number" min="0" class="form-control form-control-sm" value="0"></div>
+            <div class="col-4 d-flex align-items-end">
+              <button id="resetStep" class="btn btn-outline-secondary btn-sm w-100">Reset</button></div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Measurements + results -->
+    <div class="col-lg-8">
+      <div class="card shadow-sm mb-3">
+        <div class="card-header d-flex justify-content-between align-items-center">
+          <span class="fw-semibold">Measurements (spoke 0 = at valve, going around)</span>
+          <span>
+            <button id="btnExample" class="btn btn-outline-secondary btn-sm">Fill example</button>
+            <button id="btnClear" class="btn btn-outline-danger btn-sm">Clear</button>
+          </span>
+        </div>
+        <div class="card-body">
+          <details class="mb-2">
+            <summary class="small">Paste from spreadsheet (one row per spoke: lateral, radial, tension[, side])</summary>
+            <textarea id="csv" class="form-control form-control-sm mt-2" rows="4"
+              placeholder="0.12, -0.05, 910&#10;-0.30, 0.10, 980"></textarea>
+            <button id="btnImport" class="btn btn-secondary btn-sm mt-2">Import</button>
+          </details>
+          <div class="table-wrap">
+            <table class="table table-sm table-bordered align-middle mb-0">
+              <thead class="table-light sticky-top">
+                <tr><th>#</th><th>Side</th><th>Lateral (mm)</th><th>Radial (mm)</th><th>Tension (N)</th></tr>
+              </thead>
+              <tbody id="rows"></tbody>
+            </table>
+          </div>
+          <button id="btnAdvise" class="btn btn-primary btn-lg w-100 mt-3" disabled>Get advice</button>
+        </div>
+      </div>
+
+      <div class="card shadow-sm">
+        <div class="card-header fw-semibold">Advice</div>
+        <div id="result" class="card-body text-muted">Enter measurements and click "Get advice".</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+let session = null;
+
+/* ---------- helpers ---------- */
+const parseList = t => String(t).split(/[\s,;]+/).filter(s => s !== "").map(Number);
+const pick = (arr, i) => arr.length === 1 ? arr[0] : arr[i];
+const mean = a => a.reduce((s, v) => s + v, 0) / a.length;
+const ptp = a => Math.max(...a) - Math.min(...a);
+const randn = () => Math.sqrt(-2 * Math.log(1 - Math.random())) * Math.cos(2 * Math.PI * Math.random());
+
+function showAlert(msg) { const b = $("alertBox"); b.textContent = msg; b.classList.remove("d-none"); }
+function hideAlert() { $("alertBox").classList.add("d-none"); }
+
+/* ---------- table ---------- */
+function buildTable(n, side) {
+  const tb = $("rows"); tb.innerHTML = "";
+  for (let i = 0; i < n; i++) {
+    const s = side ? side[i] : (i % 2 === 0 ? 1 : -1);
+    tb.insertAdjacentHTML("beforeend", `
+      <tr id="r${i}"><th scope="row">${i}</th>
+        <td><select class="form-select form-select-sm side">
+          <option value="1" ${s > 0 ? "selected" : ""}>+1</option>
+          <option value="-1" ${s < 0 ? "selected" : ""}>-1</option></select></td>
+        <td><input type="number" step="0.01" class="form-control form-control-sm lat"></td>
+        <td><input type="number" step="0.01" class="form-control form-control-sm rad"></td>
+        <td><input type="number" step="1" class="form-control form-control-sm ten"></td>
+      </tr>`);
+  }
+}
+
+function readTable(n) {
+  const rows = [...document.querySelectorAll("#rows tr")];
+  if (rows.length !== n) { showAlert(`Table has ${rows.length} rows but N=${n}.`); return null; }
+  const out = { lat: [], rad: [], ten: [], side: [] };
+  for (let i = 0; i < n; i++) {
+    const r = rows[i];
+    const v = c => r.querySelector(c).value;
+    const lat = parseFloat(v(".lat")), rad = parseFloat(v(".rad")), ten = parseFloat(v(".ten"));
+    if ([lat, rad, ten].some(Number.isNaN)) { showAlert(`Missing value in spoke ${i}.`); return null; }
+    out.lat.push(lat); out.rad.push(rad); out.ten.push(ten); out.side.push(parseFloat(v(".side")));
+  }
+  return out;
+}
+
+$("cfgN").addEventListener("change", () => buildTable(+$("cfgN").value));
+$("btnClear").onclick = () => { buildTable(+$("cfgN").value); $("result").textContent = ""; };
+$("resetStep").onclick = () => { $("step").value = 0; };
+
+$("btnExample").onclick = () => {
+  const mid = parseList($("tMid").value);
+  document.querySelectorAll("#rows tr").forEach((r, i) => {
+    r.querySelector(".lat").value = (randn() * 0.6).toFixed(2);
+    r.querySelector(".rad").value = (randn() * 0.4).toFixed(2);
+    r.querySelector(".ten").value = Math.round(pick(mid, i) + randn() * 80);
+  });
+};
+
+$("btnImport").onclick = () => {
+  const lines = $("csv").value.split(/\n/).map(l => l.trim()).filter(Boolean);
+  const rows = [...document.querySelectorAll("#rows tr")];
+  if (lines.length !== rows.length) return showAlert(`Pasted ${lines.length} rows, expected ${rows.length}.`);
+  hideAlert();
+  lines.forEach((l, i) => {
+    const p = parseList(l);
+    rows[i].querySelector(".lat").value = p[0];
+    rows[i].querySelector(".rad").value = p[1];
+    rows[i].querySelector(".ten").value = p[2];
+    if (p[3] !== undefined) rows[i].querySelector(".side").value = p[3] > 0 ? "1" : "-1";
+  });
+};
+
+/* ---------- action decoding ---------- */
+function decode(a, n) {
+  let spoke, d;
+  if ($("layout").value === "interleaved") { spoke = Math.floor(a / 2); d = a % 2; }
+  else { d = Math.floor(a / n); spoke = a % n; }
+  const tighten = $("tightenDir").value === "0" ? d === 0 : d === 1;
+  return { spoke, tighten };
+}
+
+/* ---------- advice ---------- */
+async function advise() {
+  hideAlert();
+  if (!session) return showAlert("Model not loaded.");
+  const n = +$("cfgN").value;
+  const m = readTable(n); if (!m) return;
+
+  const goals = [+$("goalLat").value, +$("goalRad").value];
+  const tMid = parseList($("tMid").value), tHalf = parseList($("tHalf").value);
+  const tMin = parseList($("tMin").value), tMax = parseList($("tMax").value);
+  const dT = +$("dT").value, maxSteps = +$("maxSteps").value, step = +$("step").value;
+
+  const mLat = mean(m.lat), mRad = mean(m.rad);
+  const x = new Float32Array(5 * n);
+  for (let i = 0; i < n; i++) {
+    x[i]         = (m.lat[i] - mLat) / goals[0];
+    x[n + i]     = (m.rad[i] - mRad) / goals[1];
+    x[2 * n + i] = (m.ten[i] - pick(tMid, i)) / pick(tHalf, i);
+    x[3 * n + i] = m.side[i];
+    x[4 * n + i] = step / maxSteps;
+  }
+
+  // current status
+  const pLat = ptp(m.lat), pRad = ptp(m.rad);
+  const viol = m.ten.map((t, i) => t < pick(tMin, i) || t > pick(tMax, i));
+  const nViol = viol.filter(Boolean).length;
+  const ok = pLat <= goals[0] && pRad <= goals[1] && nViol === 0;
+  const badge = (good, txt) => `<span class="badge text-bg-${good ? "success" : "danger"}">${txt}</span>`;
+  let html = `
+    <div class="mb-3">
+      <div>Lateral peak-to-peak: <b>${pLat.toFixed(2)} mm</b> (goal ≤ ${goals[0]}) ${badge(pLat <= goals[0], pLat <= goals[0] ? "OK" : "high")}</div>
+      <div>Radial peak-to-peak: <b>${pRad.toFixed(2)} mm</b> (goal ≤ ${goals[1]}) ${badge(pRad <= goals[1], pRad <= goals[1] ? "OK" : "high")}</div>
+      <div>Tension outside safe range: <b>${nViol}</b> spoke(s) ${badge(nViol === 0, nViol === 0 ? "OK" : "check")}</div>
+    </div>`;
+
+  if (ok) {
+    $("result").innerHTML = html + `<div class="alert alert-success mb-0"><b>Goals met.</b> Stop adjusting and check dish with the dishing gauge.</div>`;
+    return;
+  }
+
+  let out;
+  try {
+    out = await session.run({ obs: new ort.Tensor("float32", x, [1, 5, n]) });
+  } catch (e) { return showAlert("Model run failed: " + e.message); }
+
+  const logits = Array.from(out.logits.data);
+  if (logits.length !== 2 * n) return showAlert(`Model returned ${logits.length} logits, expected ${2 * n} (check N).`);
+
+  // safety mask: forbid moves that leave the safe tension range
+  const masked = logits.map((l, a) => {
+    const { spoke, tighten } = decode(a, n);
+    const newT = m.ten[spoke] + (tighten ? dT : -dT);
+    return (newT < pick(tMin, spoke) || newT > pick(tMax, spoke)) ? -Infinity : l;
+  });
+  const mx = Math.max(...masked);
+  if (!isFinite(mx)) return showAlert("All moves would violate the tension limits.");
+  const ex = masked.map(l => Math.exp(l - mx)), Z = ex.reduce((s, v) => s + v, 0);
+  const prob = ex.map(v => v / Z);
+  const top = prob.map((p, a) => [p, a]).sort((u, v) => v[0] - u[0]).slice(0, 3);
+
+  document.querySelectorAll("#rows tr.hl").forEach(r => r.classList.remove("hl"));
+  html += `<h6>Recommended move</h6><ol class="list-group list-group-numbered mb-2">`;
+  top.forEach(([p, a], k) => {
+    const { spoke, tighten } = decode(a, n);
+    const sd = m.side[spoke] > 0 ? "side +1" : "side −1";
+    html += `<li class="list-group-item d-flex justify-content-between align-items-start ${k === 0 ? "list-group-item-primary" : ""}">
+      <div class="ms-2 me-auto"><b>Spoke ${spoke}</b> (${sd}): <b>${tighten ? "TIGHTEN" : "LOOSEN"}</b> ¼ turn
+      <div class="small text-muted">expected tension after: ${Math.round(m.ten[spoke] + (tighten ? dT : -dT))} N</div></div>
+      <span class="badge text-bg-secondary rounded-pill">${(p * 100).toFixed(0)}%</span></li>`;
+    if (k === 0) $("r" + spoke).classList.add("hl");
+  });
+  html += `</ol><div class="small text-muted">Value estimate: ${out.value.data[0].toFixed(2)} · Step ${step}/${maxSteps}.
+    Make the turn, re-measure, update the table, then click again.</div>`;
+  $("result").innerHTML = html;
+  $("step").value = step + 1;
+}
+$("btnAdvise").onclick = advise;
+
+/* ---------- startup ---------- */
+async function init() {
+  buildTable(+$("cfgN").value);
+  try {                                    // optional config.json
+    const r = await fetch("config.json");
+    if (r.ok) {
+      const c = await r.json();
+      $("cfgN").value = c.n;
+      $("goalLat").value = c.goals[0]; $("goalRad").value = c.goals[1];
+      const asArr = v => Array.isArray(v) ? v : [v];
+      const mid = asArr(c.t_mid), half = asArr(c.t_half);
+      const L = Math.max(mid.length, half.length);
+      $("tMid").value = mid.join(", "); $("tHalf").value = half.join(", ");
+      $("tMin").value = Array.from({length: L}, (_, i) => pick(mid, i) - pick(half, i)).join(", ");
+      $("tMax").value = Array.from({length: L}, (_, i) => pick(mid, i) + pick(half, i)).join(", ");
+      if (c.max_steps) $("maxSteps").value = c.max_steps;
+      if (c.dT) $("dT").value = c.dT;
+      buildTable(c.n, c.side);
+    }
+  } catch (e) { /* use defaults */ }
+  try {
+    session = await ort.InferenceSession.create("wheel_truing.onnx", { executionProviders: ["wasm"], externalData: [{ path: "wheel_truing.onnx.data", data: "wheel_truing.onnx.data" }] });
+    $("modelStatus").className = "badge text-bg-success";
+    $("modelStatus").textContent = "model ready";
+    $("btnAdvise").disabled = false;
+  } catch (e) {
+    $("modelStatus").className = "badge text-bg-danger";
+    $("modelStatus").textContent = "model failed";
+    showAlert("Could not load wheel_truing.onnx. Serve this folder over HTTP (not file://). " + e.message);
+  }
+}
+init();
+</script>
+</body>
+</html>
